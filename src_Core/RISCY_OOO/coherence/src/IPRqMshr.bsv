@@ -196,7 +196,8 @@ module mkIPRqMshrSafe(
             reqVec[n][pipelineResp_port] <= PRqMsg {
                 addr: a,
                 toState: I,
-                child: ?
+                child: ?,
+                isInvisible: False
             };
         endmethod
 `endif

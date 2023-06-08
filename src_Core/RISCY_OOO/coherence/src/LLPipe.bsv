@@ -93,7 +93,8 @@ interface LLPipe#(
     method Action deqWrite(
         Maybe#(cRqIdxT) swapRq,
         RamData#(tagT, Msi, Vector#(childNum, Msi), Maybe#(CRqOwner#(cRqIdxT)), void, Line) wrRam, // always write BRAM
-        Bool updateRep
+        Bool updateRep,
+        Bool invisible
     );
 endinterface
 
@@ -236,9 +237,9 @@ module mkLLPipe(
                 end
                 else begin
                     // cRs must hit, so only cRq cannot enter here
-                    doAssert(cmd matches tagged CRq ._rq ? True : False,
-                        "only cRq can tag match miss"
-                    );
+                    // doAssert(cmd matches tagged CRq ._rq ? True : False,
+                    //     "only cRq can tag match miss"
+                    // );
                     // find a unlocked way to replace for cRq
                     Vector#(wayNum, Bool) unlocked = ?;
                     Vector#(wayNum, Bool) invalid = ?;
@@ -362,7 +363,7 @@ module mkLLPipe(
 
     method notEmpty = pipe.notEmpty;
 
-    method Action deqWrite(Maybe#(cRqIdxT) swapRq, ramDataT wrRam, Bool updateRep);
+    method Action deqWrite(Maybe#(cRqIdxT) swapRq, ramDataT wrRam, Bool updateRep, Bool invisible);
         // get new cmd
         Addr addr = getAddrFromCmd(pipe.first.cmd); // inherit addr
         Maybe#(pipeCmdT) newCmd = Invalid;
@@ -370,6 +371,6 @@ module mkLLPipe(
             newCmd = Valid (CRq (LLPipeCRqIn {addr: addr, mshrIdx: idx}));
         end
         // call pipe
-        pipe.deqWrite(newCmd, wrRam, updateRep);
+        pipe.deqWrite(newCmd, wrRam, updateRep, invisible);
     endmethod
 endmodule

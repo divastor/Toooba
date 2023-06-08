@@ -21,6 +21,8 @@
 // CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
+`define PDP
+
 `include "ProcConfig.bsv"
 import Types::*;
 import ProcTypes::*;
@@ -44,6 +46,7 @@ export LSQUpdateAddrResult(..);
 export LSQForwardResult(..);
 export LdStalledBy(..);
 export LSQIssueLdResult(..);
+export LSQToCacheResult(..);
 export LSQIssueLdInfo(..);
 export LSQRespLdResult(..);
 export LSQHitInfo(..);
@@ -108,6 +111,8 @@ export isStQMemFunc;
 // needs not to be dequeued from SQ; and older LQ entries can still exist.
 
 typedef enum {Ld, Lr} LdQMemFunc deriving(Bits, Eq, FShow);
+// InvisiSpec: the state of the load request.
+typedef enum {E, V, C, N} SpecState deriving(Bits, Eq, FShow);
 
 // LQ holds Ld and Lr. This type is for documentation purpose, it is not really
 // used.
@@ -265,8 +270,9 @@ typedef struct {
 
 typedef enum {LdQ, StQ, SB} LdStalledBy deriving(Bits, Eq, FShow);
 
+typedef enum {Normal, Invisible} LSQToCacheResult deriving(Bits, Eq, FShow);
 typedef union tagged {
-    void ToCache;
+    LSQToCacheResult ToCache;
     LdStalledBy Stall;
     LSQForwardResult Forward;
 } LSQIssueLdResult deriving(Bits, Eq, FShow);
@@ -608,7 +614,7 @@ module mkSplitLSQ(SplitLSQ);
 
     // LQ
     // entry valid bits
-    Vector#(LdQSize, Ehr#(2, Bool))                 ld_valid           <- replicateM(mkEhr(False));
+    Vector#(LdQSize, Ehr#(3, Bool))                 ld_valid           <- replicateM(mkEhr(False));
     // entry contents
     Vector#(LdQSize, Reg#(InstTag))                 ld_instTag         <- replicateM(mkRegU);
     Vector#(LdQSize, Reg#(LdQMemFunc))              ld_memFunc         <- replicateM(mkRegU);
@@ -623,7 +629,7 @@ module mkSplitLSQ(SplitLSQ);
     Vector#(LdQSize, Ehr#(2, Maybe#(Exception)))    ld_fault           <- replicateM(mkEhr(?));
     Vector#(LdQSize, Ehr#(2, Bool))                 ld_computed        <- replicateM(mkEhr(?));
     Vector#(LdQSize, Ehr#(3, Bool))                 ld_inIssueQ        <- replicateM(mkEhr(?));
-    Vector#(LdQSize, Ehr#(2, Bool))                 ld_executing       <- replicateM(mkEhr(?));
+    Vector#(LdQSize, Ehr#(3, Bool))                 ld_executing       <- replicateM(mkEhr(?));
     Vector#(LdQSize, Ehr#(2, Bool))                 ld_done            <- replicateM(mkEhr(?));
     Vector#(LdQSize, Ehr#(3, Maybe#(LdKilledBy)))   ld_killed          <- replicateM(mkEhr(?));
     Vector#(LdQSize, Ehr#(2, Maybe#(StQTag)))       ld_olderSt         <- replicateM(mkEhr(?));
@@ -637,11 +643,18 @@ module mkSplitLSQ(SplitLSQ);
 `endif
     Vector#(LdQSize, Ehr#(3, SpecBits))             ld_specBits        <- replicateM(mkEhr(?));
     Vector#(LdQSize, Ehr#(TAdd#(1, SupSize), Bool)) ld_atCommit        <- replicateM(mkEhr(?));
+    // InvisiSpec: speculative state of the load and performed status
+    Vector#(LdQSize, Ehr#(4, SpecState))            ld_specState       <- replicateM(mkEhr(N));
+    Vector#(LdQSize, Ehr#(2, Bool))                 ld_specPerformed   <- replicateM(mkEhr(?));
+    Vector#(LdQSize, Ehr#(2, Bool))                 ld_atVisibilityPoint <- replicateM(mkEhr(?));
+    Vector#(LdQSize, Ehr#(2, Bool))                 ld_specReissued    <- replicateM(mkEhr(False));
+    Vector#(LdQSize, Ehr#(2, Bool))                 ld_preProcessed     <- replicateM(mkEhr(False));
     // wrong-path load filter (must init to all False)
     Vector#(LdQSize, Ehr#(1, Bool))                 ld_waitWPResp      <- replicateM(mkEhr(False));
     // enq/deq ptr
     Reg#(LdQTag)    ld_enqP <- mkReg(0);
     Ehr#(2, LdQTag) ld_deqP <- mkEhr(0);
+    Ehr#(2, LdQTag) ld_PdeqP <- mkEhr(0);
 
     // Ports of each EHR used in each method or rule ("write" means the write
     // port is used, "assert" means the port is only used for assert in
@@ -652,12 +665,12 @@ module mkSplitLSQ(SplitLSQ);
     let ld_valid_verify    = getVEhrPort(ld_valid, 0); // only for TSO, C with deqLd
     let ld_valid_evict     = getVEhrPort(ld_valid, 1);
     let ld_valid_updAddr   = getVEhrPort(ld_valid, 1);
-    let ld_valid_issue     = getVEhrPort(ld_valid, 1);
-    let ld_valid_enqIss    = getVEhrPort(ld_valid, 1); // assert
-    let ld_valid_deqSt     = getVEhrPort(ld_valid, 1);
-    let ld_valid_setCom    = getVEhrPort(ld_valid, 1); // assert
-    let ld_valid_resp      = getVEhrPort(ld_valid, 1); // assert
-    let ld_valid_enq       = getVEhrPort(ld_valid, 1); // write
+    let ld_valid_issue     = getVEhrPort(ld_valid, 1); // write
+    let ld_valid_enqIss    = getVEhrPort(ld_valid, 2); // assert
+    let ld_valid_deqSt     = getVEhrPort(ld_valid, 2);
+    let ld_valid_setCom    = getVEhrPort(ld_valid, 2); // assert
+    let ld_valid_resp      = getVEhrPort(ld_valid, 2); // assert
+    let ld_valid_enq       = getVEhrPort(ld_valid, 2); // write
 
     let ld_paddr_findIss = getVEhrPort(ld_paddr, 0);
     let ld_paddr_deqLd   = getVEhrPort(ld_paddr, 0);
@@ -710,6 +723,7 @@ module mkSplitLSQ(SplitLSQ);
     let ld_executing_enqIss    = getVEhrPort(ld_executing, 1); // assert
     let ld_executing_resp      = getVEhrPort(ld_executing, 1); // assert
     let ld_executing_enq       = getVEhrPort(ld_executing, 1); // write
+    let ld_executing_correctSpec       = getVEhrPort(ld_executing, 2); // write
 
     let ld_done_wrongSpec = getVEhrPort(ld_done, 0);
     let ld_done_deqLd     = getVEhrPort(ld_done, 0);
@@ -791,9 +805,46 @@ module mkSplitLSQ(SplitLSQ);
     let ld_waitWPResp_resp      = getVEhrPort(ld_waitWPResp, 0); // write
     let ld_waitWPResp_wrongSpec = getVEhrPort(ld_waitWPResp, 0); // write
 
+    Reg#(LdQTag) ld_deqP_wrongSpec = ld_deqP[0]; // write
     Reg#(LdQTag) ld_deqP_deqLd  = ld_deqP[0]; // write
     Reg#(LdQTag) ld_deqP_verify = ld_deqP[0]; // in TSO, C with deqLd
+    Reg#(LdQTag) ld_deqP_issue   = ld_deqP[1]; // write
     Reg#(LdQTag) ld_deqP_deqSt  = ld_deqP[1];
+    Reg#(LdQTag) ld_PdeqP_wrongSpec = ld_PdeqP[0]; // read
+    Reg#(LdQTag) ld_PdeqP_deqLd     = ld_PdeqP[0]; // write
+    Reg#(LdQTag) ld_PdeqP_updAddr   = ld_PdeqP[0]; // read
+    Reg#(LdQTag) ld_PdeqP_issue     = ld_PdeqP[0]; // read
+
+    // InvisiSpec: speculative state ports.
+    let ld_specState_findIss = getVEhrPort(ld_specState, 0); // read
+    let ld_specState_wrongSpec   = getVEhrPort(ld_specState, 0); // write
+    let ld_specState_deqLd   = getVEhrPort(ld_specState, 0); // read
+    let ld_specState_issue   = getVEhrPort(ld_specState, 1); // write
+    let ld_specState_resp    = getVEhrPort(ld_specState, 1); // read
+    let ld_specState_enq     = getVEhrPort(ld_specState, 2); // write
+    let ld_specState_correctSpec = getVEhrPort(ld_specState, 3); // write
+
+    let ld_specPerformed_findIss = getVEhrPort(ld_specPerformed, 0); // read
+    let ld_specPerformed_hit     = getVEhrPort(ld_specPerformed, 0); // read
+    let ld_specPerformed_issue   = getVEhrPort(ld_specPerformed, 0); // read
+    let ld_specPerformed_enqIss  = getVEhrPort(ld_specPerformed, 0); // read
+    let ld_specPerformed_resp    = getVEhrPort(ld_specPerformed, 0); // write
+    let ld_specPerformed_enq     = getVEhrPort(ld_specPerformed, 1); // write
+
+    let ld_atVisibilityPoint_findIss     = getVEhrPort(ld_atVisibilityPoint, 0); // read
+    let ld_atVisibilityPoint_enqIss      = getVEhrPort(ld_atVisibilityPoint, 0); // assert
+    let ld_atVisibilityPoint_enq         = getVEhrPort(ld_atVisibilityPoint, 0); // write
+    let ld_atVisibilityPoint_correctSpec = getVEhrPort(ld_atVisibilityPoint, 1); // write
+
+    let ld_specReissued_findIss = getVEhrPort(ld_specReissued, 0); // read
+    let ld_specReissued_enqIss  = getVEhrPort(ld_specReissued, 0); // write
+    let ld_specReissued_resp    = getVEhrPort(ld_specReissued, 1); // write
+
+    let ld_preProcessed_wrongSpec = getVEhrPort(ld_preProcessed, 0); // read
+    let ld_preProcessed_deqLd     = getVEhrPort(ld_preProcessed, 0); // write
+    let ld_preProcessed_updAddr   = getVEhrPort(ld_preProcessed, 0); // read
+    let ld_preProcessed_issue     = getVEhrPort(ld_preProcessed, 0); // read
+    let ld_preProcessed_enq       = getVEhrPort(ld_preProcessed, 1); // write
 
     // SQ
     // entry valid bits
@@ -1042,6 +1093,47 @@ module mkSplitLSQ(SplitLSQ);
         getReadFromVirTag, genWith(fromInteger)
     );
 
+    function LdQVirTag getDeqVirTag(LdQTag i);
+        return i < ld_deqP[0] ? zeroExtend(i) + fromInteger(valueof(LdQSize))
+                              : zeroExtend(i);
+    endfunction
+    Vector#(LdQSize, LdQVirTag) deqVirTags = map(getDeqVirTag,
+                                                 genWith(fromInteger));
+
+    function Maybe#(LdQTag) findOldestDeq(Vector#(LdQSize, Bool) pred);
+        function LdQTag getOlder(LdQTag a, LdQTag b);
+            if(!pred[a]) begin
+                return b;
+            end
+            else if(!pred[b]) begin
+                return a;
+            end
+            else begin
+                return deqVirTags[a] < deqVirTags[b] ? a : b;
+            end
+        endfunction
+        Vector#(LdQSize, LdQTag) idxVec = genWith(fromInteger);
+        LdQTag tag = fold(getOlder, idxVec);
+        return pred[tag] ? Valid (tag) : Invalid;
+    endfunction
+
+    function Maybe#(LdQTag) findYoungestDeq(Vector#(LdQSize, Bool) pred);
+        function LdQTag getYounger(LdQTag a, LdQTag b);
+            if(!pred[a]) begin
+                return b;
+            end
+            else if(!pred[b]) begin
+                return a;
+            end
+            else begin
+                return deqVirTags[a] < deqVirTags[b] ? b : a;
+            end
+        endfunction
+        Vector#(LdQSize, LdQTag) idxVec = genWith(fromInteger);
+        LdQTag tag = fold(getYounger, idxVec);
+        return pred[tag] ? Valid (tag) : Invalid;
+    endfunction
+
     // find load ready for issuing when LSQ is not empty:
     // (1) entry valid of load
     // (2) computed (this implies no fault)
@@ -1059,13 +1151,18 @@ module mkSplitLSQ(SplitLSQ);
                 ld_valid_findIss[i] && ld_memFunc[i] == Ld && // (1) valid load
                 ld_computed_findIss[i] && // (2) computed
                 !ld_inIssueQ_findIss[i] && // (3) not in issueQ
-                !ld_executing_findIss[i] && // (4) not executing (or done)
-                !isValid(ld_depLdQDeq_findIss[i]) &&
+                ((!ld_executing_findIss[i] && // (4) not executing (or done)
+                  !isValid(ld_depLdQDeq_findIss[i]) &&
 `ifndef TSO_MM
-                !isValid(ld_depLdEx_findIss[i]) &&
-                !isValid(ld_depSBDeq_findIss[i]) &&
+                  !isValid(ld_depLdEx_findIss[i]) &&
+                  !isValid(ld_depSBDeq_findIss[i]) &&
 `endif
-                !isValid(ld_depStQDeq_findIss[i]) && // (5) no dependency
+                  !isValid(ld_depStQDeq_findIss[i])) || // (5) no dependency
+                 (ld_atVisibilityPoint_findIss[i] && // or at visibility point,
+                  (ld_specState_findIss[i] != C && 
+                   ld_specState_findIss[i] != N) && // but has not completed
+                  ld_specPerformed_findIss[i])) && // has performed once,
+                !ld_specReissued_findIss[i] && // not already reissued
                 !ld_waitWPResp_findIss[i] && // (6) not wating wrong path resp
                 !ld_isMMIO_findIss[i] // (7) not MMIO
             );
@@ -1101,14 +1198,14 @@ module mkSplitLSQ(SplitLSQ);
                  "enq issueQ entry cannot have fault");
         doAssert(ld_computed_enqIss[info.tag],
                  "enq issueQ entry is computed");
-        doAssert(!ld_executing_enqIss[info.tag],
-                 "enq issueQ entry cannot be executing");
-        doAssert(!ld_done_enqIss[info.tag],
-                 "enq issueQ entry cannot be done");
+        // doAssert(!ld_executing_enqIss[info.tag],
+        //          "enq issueQ entry cannot be executing");
+        // doAssert(!ld_done_enqIss[info.tag],
+        //          "enq issueQ entry cannot be done");
         doAssert(!ld_inIssueQ_enqIss[info.tag],
                  "enq issueQ entry cannot be in issueQ");
-        doAssert(!isValid(ld_killed_enqIss[info.tag]),
-                 "enq issueQ entry cannot be killed");
+        // doAssert(!isValid(ld_killed_enqIss[info.tag]),
+        //          "enq issueQ entry cannot be killed");
         doAssert(!ld_waitWPResp_enqIss[info.tag],
                  "enq issueQ entry cannot wait for wrong path resp");
         doAssert(!ld_isMMIO_enqIss[info.tag],
@@ -1124,12 +1221,22 @@ module mkSplitLSQ(SplitLSQ);
                  "BE should match");
         doAssert(info.paddr == ld_paddr_enqIss[info.tag],
                  "paddr should match");
+        doAssert(!ld_executing_enqIss[info.tag] ||
+                 (ld_executing_enqIss[info.tag] &&
+                 (ld_specPerformed_enqIss[info.tag] &&
+                  ld_atVisibilityPoint_enqIss[info.tag] &&
+                  !ld_specReissued_enqIss[info.tag])),
+                 "should either be the first time performing or has performed once and is at visibility point");
         // enq to issueQ & change state (prevent enq this tag again)
         issueLdQ.enq(ToSpecFifo {
             data: info,
             spec_bits: ld_specBits_enqIss[info.tag]
         });
         ld_inIssueQ_enqIss[info.tag] <= True;
+        if (ld_specPerformed_enqIss[info.tag]) begin
+            ld_specReissued_enqIss[info.tag] <= True;
+            if(verbose) $display("[LSQ - enqIss] - ld reissued, tag:", fshow(info.tag));
+        end
         // make conflict with incorrect spec
         wrongSpec_enqIss_conflict.wset(?);
     endrule
@@ -1218,6 +1325,58 @@ module mkSplitLSQ(SplitLSQ);
             doAssert(ld_enqP == ld_deqP[0], "empty queue have enqP = deqP");
         end
         else begin
+`ifdef PDP // since there can be valid USLs awaiting reissue outside of [PdeqP, enqP)
+            function Bool in_valid_range(LdQTag i);
+                if (ld_enqP == ld_deqP[0] && ld_valid[ld_enqP][0]) begin
+                    // queue full of entries
+                    if(ld_PdeqP[0] == ld_enqP && !ld_preProcessed[ld_enqP][0]) begin
+                        // queue full of non pre-dequeued entries => all valid
+                        return True;
+                    end
+                    else begin
+                        // PdeqP has moved
+                        return deqVirTags[ld_PdeqP[0]] <= deqVirTags[i] &&  // check if tag not pre-dequeued 
+                               ld_PdeqP[0] != ld_enqP;                      // if PdeqP is @end -> False
+                    end
+                end
+                else begin
+                    // queue is not full, check if within valid bounds
+                    return deqVirTags[ld_PdeqP[0]] <= deqVirTags[i] && deqVirTags[i] < deqVirTags[ld_enqP];
+                end
+            endfunction
+            function Bool in_deq_range(LdQTag i);
+                if (ld_enqP == ld_deqP[0] && ld_valid[ld_enqP][0]) begin
+                    // queue full of entries
+                    if(ld_PdeqP[0] == ld_enqP && !ld_preProcessed[ld_enqP][0]) begin
+                        // queue full of non pre-dequeued entries => all valid
+                        return False;
+                    end
+                    else begin
+                        // PdeqP has moved
+                        return deqVirTags[i] < deqVirTags[ld_PdeqP[0]]  // tag is in deq range
+                               || ld_PdeqP[0] == ld_enqP;               // OR PdeqP has reached the end
+                    end
+                end
+                else begin
+                    // queue is not full, check if within deq range
+                    return deqVirTags[i] < deqVirTags[ld_PdeqP[0]];
+                end
+            endfunction
+            for(Integer i = 0; i < valueof(LdQSize); i = i+1) begin
+                if (in_valid_range(fromInteger(i))) begin
+                    doAssert(ld_valid[i][0],
+                            "valid entries must be within [PdeqP, enqP)");
+                end
+                else if (in_deq_range(fromInteger(i))) begin
+                    doAssert(ld_valid[i][0] || (ld_specState[i][0] == C || ld_specState[i][0] == N),
+                            "valid or completed entries must be within [deqP, PdeqP)");
+                end
+                else begin
+                    doAssert(!ld_valid[i][0],
+                            "invalid entries must be outside [deqP, enqP)");
+                end
+            end
+`else
             // not empty queue, check valid entries with [deqP, enqP)
             function Bool in_range(LdQTag i);
                 if(ld_deqP[0] < ld_enqP) begin
@@ -1231,6 +1390,7 @@ module mkSplitLSQ(SplitLSQ);
                 doAssert(in_range(fromInteger(i)) == ld_valid[i][0],
                         "valid entries must be within [deqP, enqP)");
             end
+`endif
         end
     endrule
 
@@ -1289,7 +1449,7 @@ module mkSplitLSQ(SplitLSQ);
     (* fire_when_enabled, no_implicit_conditions *)
     rule checkLdQVerified;
         for(Integer i = 0; i < valueof(LdQSize); i = i+1) begin
-            if (ld_valid[i][0] &&&
+            if (!ld_preProcessed[i][0] && ld_valid[i][0] &&&
                 ld_olderSt[i][0] matches tagged Valid .stTag) begin
                 doAssert(st_valid[stTag][0], "older SQ entry must be valid");
                 doAssert(ld_olderStVerified[i][0] == st_verified[stTag][0],
@@ -1310,8 +1470,8 @@ module mkSplitLSQ(SplitLSQ);
 
     // deqLd guard (see comments at the method declaration)
     function Bool deqLdGuard;
-        LdQTag deqP = ld_deqP_deqLd;
-        if(!ld_valid_deqLd[deqP]) begin
+        LdQTag deqP = ld_PdeqP_deqLd;
+        if(!ld_valid_deqLd[deqP] || ld_preProcessed_deqLd[deqP]) begin
             return False; // not valid
         end
         else begin
@@ -1359,10 +1519,12 @@ module mkSplitLSQ(SplitLSQ);
             method Action put(LdStQTag lsqTag);
                 case(lsqTag) matches
                     tagged Ld .tag: begin
+                        if(verbose) $display("[LSQ setAtCommit] ld at commit, ldTag:", fshow(tag));
                         ld_atCommit_setCom[i][tag] <= True;
                         doAssert(ld_valid_setCom[tag], "must be valid");
                     end
                     tagged St .tag: begin
+                        if(verbose) $display("[LSQ setAtCommit] st at commit, stTag:", fshow(tag));
                         st_atCommit_setCom[i][tag] <= True;
                         doAssert(st_valid_setCom[tag], "must be valid");
                     end
@@ -1387,7 +1549,10 @@ module mkSplitLSQ(SplitLSQ);
         return (case(t) matches
             tagged Ld .tag: (LSQHitInfo {
                 waitWPResp: ld_waitWPResp_hit[tag],
-                dst: ld_dst[tag]
+                // A trick in order to not ready the Aggr Scoreboard in 
+                // the case of reissued USLs. The registers get updated
+                // on the initial issue of the USL.
+                dst: !ld_specPerformed_hit[tag] ? ld_dst[tag] : Invalid
             });
             tagged St .tag: (LSQHitInfo {
                 waitWPResp: False,
@@ -1445,6 +1610,10 @@ module mkSplitLSQ(SplitLSQ);
 `endif
         ld_specBits_enq[ld_enqP] <= spec_bits;
         ld_atCommit_enq[ld_enqP] <= False;
+        ld_specState_enq[ld_enqP] <= spec_bits == 0 ? N : E;
+        ld_specPerformed_enq[ld_enqP] <= False;
+        ld_atVisibilityPoint_enq[ld_enqP] <= False;
+        ld_preProcessed_enq[ld_enqP] <= False;
         // don't touch wait wrong resp
         // Record older St. XXX We must use the up-to-date value st_valid;
         // otherwise, we may record a valid olderSt and never get it reset.
@@ -1619,7 +1788,7 @@ module mkSplitLSQ(SplitLSQ);
             // We don't check computed or memFunc, because there is no pure fence
             // in LQ, and they are implied by executing bit
             function Bool needKill(LdQTag i);
-                Bool valid = ld_valid_updAddr[i];
+                Bool valid = ld_valid_updAddr[i] && !ld_preProcessed_updAddr[i];
                 Bool younger = youngerLds[i];
                 Bool overlap = overlapAddr(pa, shift_be,
                                            ld_paddr_updAddr[i],
@@ -1695,9 +1864,9 @@ module mkSplitLSQ(SplitLSQ);
         doAssert(ld_valid_issue[tag], "issuing Ld must be valid");
         doAssert(!isValid(ld_fault_issue[tag]), "issuing Ld cannot be fault");
         doAssert(ld_computed_issue[tag], "issuing Ld must be computed");
-        doAssert(!ld_executing_issue[tag], "issuing Ld must not be executing");
-        doAssert(!ld_done_issue[tag], "issuing Ld must not be done");
-        doAssert(!isValid(ld_killed_issue[tag]), "issuing Ld must not be killed");
+        // doAssert(!ld_executing_issue[tag], "issuing Ld must not be executing");
+        // doAssert(!ld_done_issue[tag], "issuing Ld must not be done");
+        // doAssert(!isValid(ld_killed_issue[tag]), "issuing Ld must not be killed");
         doAssert(ld_memFunc[tag] == Ld, "only issue Ld");
         doAssert(!ld_isMMIO_issue[tag], "issuing Ld cannot be MMIO");
         doAssert(
@@ -1814,7 +1983,7 @@ module mkSplitLSQ(SplitLSQ);
         // and has overlap addr
         LdQVirTag issueVTag = ldVirTags[tag];
         function Bool isLdNeedCheck(LdQTag i);
-            Bool valid = ld_valid_issue[i];
+            Bool valid = ld_valid_issue[i] && !ld_preProcessed_issue[i];
             Bool older = ldVirTags[i] < issueVTag;
             Bool acquire = ld_acq[i];
             Bool computed = ld_computed_issue[i];
@@ -1850,6 +2019,36 @@ module mkSplitLSQ(SplitLSQ);
         Maybe#(StQVirTag) ldTagOlderSt = olderStVirTags[ldTag];
         StQTag stTag = validValue(matchStTag);
         StQVirTag stVTag = stVirTags[stTag];
+        if (ld_specPerformed_issue[tag]) begin
+            // send to cache
+            issRes = ToCache (Normal);
+            // move the deqP if necessary
+            if (ld_preProcessed_issue[tag]) begin
+                function Bool isStillValidDeq(LdQTag i);
+                    // (1) the current tag is considered invalid
+                    // (2) return true if a tag is valid
+                    // (3) and if it has been pre-processed, aka inside of [deqP,PdeqP)
+                    return i != tag && ld_valid_issue[i] && ld_preProcessed_issue[i];
+                endfunction
+                Vector#(LdQSize, LdQTag) ldIdxVec = genWith(fromInteger);
+                Vector#(LdQSize, Bool) validDeqs = map(isStillValidDeq,
+                                                       ldIdxVec);
+
+                let nextP;
+                if(findOldestDeq(validDeqs) matches tagged Valid .p) begin
+                    nextP = p;
+                end
+                else begin
+                    nextP = ld_PdeqP_issue;
+                end
+                if(verbose) $display("[LSQ - issueLd] deqP moved to %d, and entry %d invalidated", nextP, tag);
+                ld_deqP_issue <= nextP;
+                ld_valid_issue[tag] <= False;
+            end
+            if(verbose) $display("[LSQ - issueLd] - COMPLETED USL tag: ", fshow(tag));
+            ld_specState_issue[tag] <= C;
+        end
+        else begin
         if(isValid(matchLdTag) && (!isValid(matchStTag) ||
                                    (isValid(ldTagOlderSt) &&
                                     validValue(ldTagOlderSt) >= stVTag))) begin
@@ -1930,7 +2129,7 @@ module mkSplitLSQ(SplitLSQ);
             end
             else begin
                 // send to cache
-                issRes = ToCache;
+                issRes = ToCache (ld_specState_issue[tag] == N ? Normal : Invisible);
                 // set executing and record readFrom
                 ld_executing_issue[tag] <= True;
                 ld_readFrom_issue[tag] <= Invalid;
@@ -1951,6 +2150,19 @@ module mkSplitLSQ(SplitLSQ);
             endfunction
             Vector#(LdQSize, LdQTag) idxVec = genWith(fromInteger);
             joinActions(map(setReady, idxVec));
+        end
+        if (issRes matches tagged Forward .unused &&& ld_specState_issue[tag] != N) begin
+            // there are 2 cases:
+            // 1) either this is the first issue
+            // 2) or this is the second (performed bit set) reissue
+            // On the first issue, modify the state to not need
+            // to reissue and access the cache hierarchy 
+            // (aka convert to normal).
+            ld_specState_issue[tag] <= N;
+            if(verbose) $display("[LSQ - issueLd] - convert to Normal, tag: ", fshow(tag));
+            // On the second (performed) case, do not use forwarding. 
+            // The first issue has used the cache, so use it again.
+        end
         end
 `endif
 
@@ -1986,6 +2198,12 @@ module mkSplitLSQ(SplitLSQ);
             ld_waitWPResp_resp[t] <= False;
             res.wrongPath = True;
             res.dst = Invalid; // drop wrong path resp
+            if(verbose) $display("[LSQ - respLd] squashed WRONG PATH response for tag ", fshow(t));
+        end
+        else if(ld_specReissued_resp[t]) begin
+            ld_specReissued_resp[t] <= False;
+            res.dst = Invalid; // drop reissued resp
+            if(verbose) $display("[LSQ - respLd] squashed REISSUED response for tag ", fshow(t));
         end
         else begin
             doAssert(ld_valid_resp[t] && ld_memFunc[t] == Ld,
@@ -2013,6 +2231,13 @@ module mkSplitLSQ(SplitLSQ);
             else
                res.data = gatherLoad(ld_paddr_resp[t], ld_byteEn[t],
                                      ld_unsigned[t], alignedData);
+            if (ld_specState_resp[t] != N) begin
+                if(verbose) $display("[LSQ - respLd] - performed USL tag: ", fshow(t));
+                ld_specPerformed_resp[t] <= True;
+            end
+            else begin
+                if(verbose) $display("[LSQ - respLd] - COMPLETED NORMAL tag: ", fshow(t));
+            end
         end
         if(verbose) begin
             $display("[LSQ - respLd] ", fshow(t), "; ", fshow(alignedData),
@@ -2025,7 +2250,7 @@ module mkSplitLSQ(SplitLSQ);
     endmethod
 
     method LdQDeqEntry firstLd if(deqLdGuard);
-        LdQTag deqP = ld_deqP_deqLd;
+        LdQTag deqP = ld_PdeqP_deqLd;
         return LdQDeqEntry {
             instTag: ld_instTag[deqP],
             memFunc: ld_memFunc[deqP],
@@ -2043,9 +2268,9 @@ module mkSplitLSQ(SplitLSQ);
     endmethod
 
     method Action deqLd if(deqLdGuard);
-        LdQTag deqP = ld_deqP_deqLd;
+        LdQTag deqP = ld_PdeqP_deqLd;
 
-        if(verbose) $display("[LSQ - deqLd] deqP %d", deqP);
+        if(verbose) $display("[LSQ - deqLd] PdeqP %d", deqP);
 
         // sanity check
         if(ld_atCommit_deqLd[deqP]) begin
@@ -2062,9 +2287,23 @@ module mkSplitLSQ(SplitLSQ);
                      "cannot wait for wrong path resp");
         end
 
-        // remove the entry
-        ld_valid_deqLd[deqP] <= False;
-        ld_deqP_deqLd <= getNextLdPtr(deqP);
+        let nextP = getNextLdPtr(deqP);
+        // In case of a normal load, invalidate the entry. If it is a USL,
+        // do not invalidate and leave the reissue process responsible to
+        // invalidate it and move the deqP (in case of correct speculation).
+        // If the speculation was wrong, wrongSpec will invalidate the entry
+        // and move deqP 
+        Bool shouldInvalidate = ld_specState_deqLd[deqP] == N || ld_specState_deqLd[deqP] == C; 
+        if (shouldInvalidate) begin
+            ld_valid_deqLd[deqP] <= False;
+            if (deqP == ld_deqP_deqLd) begin
+                ld_deqP_deqLd <= nextP;
+                if(verbose) $display("[LSQ - deqLd] deqP moved as well to %d", nextP);
+            end
+        end
+        if(verbose) $display("[LSQ - deqLd] PdeqP moved to %d", nextP);
+        ld_PdeqP_deqLd <= nextP;
+        ld_preProcessed_deqLd[deqP] <= True;
 
         // wakeup loads stalled by this entry
         function Action setReady(LdQTag i);
@@ -2226,6 +2465,20 @@ module mkSplitLSQ(SplitLSQ);
             action
                 SpecBits sb = ld_specBits_correctSpec[i];
                 ld_specBits_correctSpec[i] <= sb & mask;
+                // parsing through all load/store USL tags:
+                if (ld_specState_correctSpec[i] != N && ld_specState_correctSpec[i] != C) begin
+                    if(!ld_executing_correctSpec[i]) begin
+                        // if it is a not yet issued USL => convert to normal load
+                        if ((sb != 0) && ((sb & mask) == 0))
+                            ld_specState_correctSpec[i] <= N;
+                    end
+                    else
+                    if ((sb != 0) && ((sb & mask) == 0)) begin
+                        // for all other USLs => signal that it has reached its visibility point
+                        if(verbose) $display("[LSQ - correctSpec] tag =", fshow(i));
+                        ld_atVisibilityPoint_correctSpec[i] <= True;
+                    end
+                end
             endaction
             endfunction
             Vector#(LdQSize, LdQTag) ldIdxVec = genWith(fromInteger);
@@ -2262,6 +2515,15 @@ module mkSplitLSQ(SplitLSQ);
             action
                 if(ldNeedKill[i]) begin
                     ld_valid_wrongSpec[i] <= False;
+                    // This will kill preprocessed entries as well. The reason this is allowed is to
+                    // provide a finalization point to an entry that will never get marked as being
+                    // correctly speculated (thus never provoking a re-issue causing a deadlock).
+                    if (verbose && ld_valid_wrongSpec[i]) $display("[LSQ - wrongSpec] tag =", fshow(i));
+                    if (ld_specState_wrongSpec[i] != N && ld_specState_wrongSpec[i] != C) begin
+                        if (verbose && ld_valid_wrongSpec[i]) 
+                            $display("[LSQ - wrongSpec] COMPLETED (dropped) USL tag %d", i);
+                        ld_specState_wrongSpec[i] <= C;
+                    end
                     // set wrong path load resp filter
                     if (ld_valid_wrongSpec[i] &&
                         ld_executing_wrongSpec[i] &&
@@ -2295,6 +2557,8 @@ module mkSplitLSQ(SplitLSQ);
             joinActions(map(killStQ, stIdxVec));
 
             // kill entries in issueQ
+            // This is fine for reissued, since the LSQ entries will become
+            // invalid and eventually replaced.
             issueLdQ.specUpdate.incorrectSpeculation(killAll, specTag);
 
             // change enqP: make valid entries always consecutive: new enqP is
@@ -2302,7 +2566,7 @@ module mkSplitLSQ(SplitLSQ);
             // not exists, then enqP remains the same.
             // LdQ enqP
             function Bool isValidLdKilled(LdQTag i);
-                return ld_valid_wrongSpec[i] && ldNeedKill[i];
+                return ld_valid_wrongSpec[i] && ldNeedKill[i] && !ld_preProcessed_wrongSpec[i];
             endfunction
             Vector#(LdQSize, Bool) killedValidLds = map(isValidLdKilled,
                                                         ldIdxVec);
@@ -2311,6 +2575,26 @@ module mkSplitLSQ(SplitLSQ);
                 new_ld_enqP = t;
             end
             ld_enqP <= new_ld_enqP;
+
+            doAssert(deqVirTags[ld_PdeqP_wrongSpec] <= deqVirTags[new_ld_enqP], "enqP must be gte PdeqP");
+
+            function Bool isStillValidDeq(LdQTag i);
+                // (1) return true if a tag is still valid (not killed)
+                // (2) and if it has been pre-processed (inside of [deqP,PdeqP))
+                return ld_valid_wrongSpec[i] && !ldNeedKill[i] && ld_preProcessed_wrongSpec[i];
+            endfunction
+            Vector#(LdQSize, Bool) validDeqs = map(isStillValidDeq,
+                                                ldIdxVec);
+
+            let nextP;
+            if(findOldestDeq(validDeqs) matches tagged Valid .p) begin
+                nextP = p;
+            end
+            else begin
+                nextP = ld_PdeqP_wrongSpec;
+            end
+            if(verbose && nextP != ld_deqP_wrongSpec) $display("[LSQ - wrongSpec] deqP moved to %d", nextP);
+            ld_deqP_wrongSpec <= nextP;
 
             // StQ enqP
             function Bool isValidStKilled(StQTag i);

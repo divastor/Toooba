@@ -680,7 +680,8 @@ module mkSelfInvLLBank#(
             toState: toState, // we may upgrade to E for req S, don't use toState in cRq
             child: cRq.child,
             data: rsData,
-            id: cRqId
+            id: cRqId,
+            isInvisible: cRq.isInvisible
         }));
         // release MSHR entry
         cRqMshr.sendRsToDmaC.releaseEntry(n);
@@ -754,7 +755,8 @@ module mkSelfInvLLBank#(
         pRqRsToCT req = PRq (PRqMsg {
             addr: rqAddr,
             toState: S,
-            child: child
+            child: child,
+            isInvisible: False
         });
         toCQ.enq(req);
         // change dirPend

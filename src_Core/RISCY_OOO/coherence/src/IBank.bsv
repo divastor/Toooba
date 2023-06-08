@@ -297,7 +297,8 @@ module mkIBank#(
         pRqIdxT n <- pRqMshr.getEmptyEntryInit(PRqMsg {
             addr: ?,
             toState: I,
-            child: ?
+            child: ?,
+            isInvisible: False
         });
         pipeline.send(Flush (L1PipeFlushIn {
             index: flushIndex,
@@ -331,7 +332,8 @@ module mkIBank#(
             addr: {slot.repTag, truncate(req.addr)}, // get bank id & index from req
             toState: I,
             data: Invalid, // I$ never downgrade with data to writeback
-            child: ?
+            child: ?,
+            isInvisible: False
         };
         rsToPQ.enq(resp);
         // req parent for upgrade now
@@ -354,7 +356,8 @@ module mkIBank#(
             addr: req.addr,
             toState: I, // I$ must downgrade to I
             data: Invalid, // I$ never downgrade with data to writeback
-            child: ?
+            child: ?,
+            isInvisible: False
         };
         rsToPQ.enq(resp);
         pRqMshr.sendRsToP_pRq.releaseEntry(n); // mshr entry released
@@ -378,7 +381,8 @@ module mkIBank#(
             toState: S, // I$ upgrade to S
             canUpToE: False,
             id: slot.way,
-            child: ?
+            child: ?,
+            isInvisible: False
         };
         rqToPQ.enq(cRqToP);
        if (verbose)
@@ -457,7 +461,7 @@ module mkIBank#(
                 other: ?
             },
             line: ram.line
-        }, True); // hit, so update rep info
+        }, True, False); // hit, so update rep info
         // process req to get superscalar inst read results
         // set MSHR entry as Done & save inst results
         let instResult = readInst(ram.line, req.addr);
@@ -516,7 +520,7 @@ module mkIBank#(
                     other: ?
                 },
                 line: ram.line
-            }, False);
+            }, False, False);
         endaction
         endfunction
 
@@ -533,7 +537,7 @@ module mkIBank#(
                     other: ?
                 },
                 line: ? // data is no longer used
-            }, False);
+            }, False, False);
             doAssert(ram.info.cs == S, "I$ replacement only replace S line");
             // update MSHR to save replaced tag
             // although we send req to parent later (when resp to parent is sent)
@@ -552,7 +556,7 @@ module mkIBank#(
         function Action cRqSetDepNoCacheChange;
         action
             cRqMshr.pipelineResp.setStateSlot(n, Depend, defaultValue);
-            pipeline.deqWrite(Invalid, pipeOut.ram, False);
+            pipeline.deqWrite(Invalid, pipeOut.ram, False, False);
         endaction
         endfunction
 
@@ -651,7 +655,7 @@ module mkIBank#(
             $display("%t I %m pipelineResp: pRq: drop", $time);
             // pRq can be directly dropped, no successor (since just go through pipeline)
             pRqMshr.pipelineResp.releaseEntry(n);
-            pipeline.deqWrite(Invalid, pipeOut.ram, False);
+            pipeline.deqWrite(Invalid, pipeOut.ram, False, False);
         end
         else begin
 	   if (verbose)
@@ -674,7 +678,7 @@ module mkIBank#(
                     other: ?
                 },
                 line: ? // line is not useful
-            }, False);
+            }, False, False);
             // pRq is done
             pRqMshr.pipelineResp.setDone(n);
             // send resp to parent
@@ -724,7 +728,7 @@ module mkIBank#(
                 other: ?
             },
             line: ?
-        }, False);
+        }, False, False);
 
         // check if we have finished all flush
         if (flush.index == maxBound &&

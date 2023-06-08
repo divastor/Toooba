@@ -45,7 +45,8 @@ module mkL1LLConnect#(
                 toState: r.toState,
                 canUpToE: r.canUpToE,
                 id: r.id,
-                child: child
+                child: child,
+                isInvisible: r.isInvisible
             }
         };
     endfunction
@@ -60,7 +61,8 @@ module mkL1LLConnect#(
                 addr: r.addr,
                 toState: r.toState,
                 data: r.data,
-                child: child 
+                child: child,
+                isInvisible: r.isInvisible
             }
         };
     endfunction
@@ -74,7 +76,8 @@ module mkL1LLConnect#(
             l1[i].fromP.enq(PRq (PRqMsg {
                 addr: rq.addr,
                 toState: rq.toState,
-                child: ?
+                child: ?,
+                isInvisible: rq.isInvisible
             }));
         endrule
         rule sendPRs(llc.toC.first matches tagged PRs .rs &&& rs.child == fromInteger(i));
@@ -84,7 +87,8 @@ module mkL1LLConnect#(
                 toState: rs.toState,
                 child: ?,
                 data: rs.data,
-                id: rs.id
+                id: rs.id,
+                isInvisible: rs.isInvisible
             }));
         endrule
     end

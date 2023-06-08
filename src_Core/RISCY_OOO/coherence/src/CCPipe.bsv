@@ -77,7 +77,8 @@ interface CCPipe#(
     method Action deqWrite(
         Maybe#(pipeCmdT) newCmd,
         RamData#(tagT, msiT, dirT, ownerT, otherT, lineT) wrRam,
-        Bool updateRep // update replacement info
+        Bool updateRep, // update replacement info
+        Bool invisible
     );
     // empty signal when we need to flush self-invalidate cache
     method Bool emptyForFlush;
@@ -151,6 +152,20 @@ typedef struct {
 ) deriving(Bits, Eq, FShow);
 
 typedef struct {
+    CacheInfo#(tagT, msiT, dirT, ownerT, otherT) info;
+    repT repInfo; // replacement info write into RAM
+    Maybe#(lineT) line;
+} OldCacheState#(
+    type tagT,
+    type msiT,
+    type dirT,
+    type ownerT,
+    type otherT,
+    type repT,
+    type lineT
+) deriving(Bits, Eq, FShow);
+
+typedef struct {
     wayT way;
     Bool pRqMiss;
 } TagMatchResult#(type wayT) deriving(Bits, Eq, FShow);
@@ -208,6 +223,7 @@ module mkCCPipe#(
     Alias#(enq2MatchT, Enq2Match#(wayNum, tagT, msiT, dirT, ownerT, otherT, repT, lineT, pipeCmdT)),
     Alias#(match2OutT, Match2Out#(wayT, tagT, msiT, dirT, ownerT, otherT, repT, lineT, pipeCmdT)),
     Alias#(bypassInfoT, BypassInfo#(wayT, indexT, tagT, msiT, dirT, ownerT, otherT, repT, lineT)),
+    Alias#(oldCacheStateT, OldCacheState#(tagT, msiT, dirT, ownerT, otherT, repT, lineT)),
     Bits#(tagT, _tagSz),
     Bits#(msiT, _msiSz),
     Bits#(dirT, _dirSz),
@@ -219,6 +235,8 @@ module mkCCPipe#(
     // index to data ram: {way, normal index}
     Alias#(dataIndexT, Bit#(TAdd#(TLog#(wayNum), _indexSz)))
 );
+
+   Bool verbose = False;
 
     // pipeline regs
 
@@ -239,6 +257,13 @@ module mkCCPipe#(
     // bypass write to ram
     RWire#(bypassInfoT) bypass <- mkRWire;
 
+    // old cache state of response
+    Ehr#(2, Maybe#(oldCacheStateT)) current_cache_state <- mkEhr(Invalid);
+    // port 0: out
+    Reg#(Maybe#(oldCacheStateT)) current_cache_state_out = current_cache_state[0];
+    // port 1: tag match
+    Reg#(Maybe#(oldCacheStateT)) current_cache_state_match = current_cache_state[1];
+
     // stage 2: first get bypass
     (* fire_when_enabled, no_implicit_conditions *)
     rule doMatch_bypass(isValid(bypass.wget) && isValid(enq2Mat_bypass) && initDone);
@@ -255,12 +280,15 @@ module mkCCPipe#(
         enq2MatchT e2m = fromMaybe(?, enq2Mat_match);
         // get cache output & merge with bypass
         Vector#(wayNum, infoT) infoVec;
+        Vector#(wayNum, infoT) infoVec_old;
         for(Integer i = 0; i < valueOf(wayNum); i = i+1) begin
             infoRam[i].deqRdResp;
-            infoVec[i] = fromMaybe(infoRam[i].rdResp, e2m.infoVec[i]);
+            infoVec_old[i] = infoRam[i].rdResp;
+            infoVec[i] = fromMaybe(infoVec_old[i], e2m.infoVec[i]);
         end
         repRam.deqRdResp;
-        repT repInfo = fromMaybe(repRam.rdResp, e2m.repInfo);
+        repT repInfo_old = repRam.rdResp;
+        repT repInfo = fromMaybe(repInfo_old, e2m.repInfo);
         // do tag match to get way to occupy
         Vector#(wayNum, tagT) tagVec;
         Vector#(wayNum, msiT) csVec;
@@ -299,10 +327,18 @@ module mkCCPipe#(
             m2o.info.cs = upd.cs;
             m2o.info.dir = upd.dir;
         end
+        Maybe#(lineT) line_old = Invalid;
         if(bypass.wget matches tagged Valid .b &&& b.index == index &&& b.way == way &&& !isValid(m2o.line)) begin
             // bypass has lower priority than resp data
             m2o.line = Valid (b.ram.line);
+            line_old = Valid (b.ram.line);
         end
+
+        current_cache_state_match <= Valid(OldCacheState {
+            info: infoVec_old[way],
+            repInfo: repInfo_old,
+            line: line_old
+        });
         mat2Out_match <= Valid (m2o);
         // reset enq2mat
         enq2Mat_match <= Invalid;
@@ -362,7 +398,7 @@ module mkCCPipe#(
 
     method Bool notEmpty = deq_guard;
 
-    method Action deqWrite(Maybe#(pipeCmdT) newCmd, ramDataT wrRam, Bool updateRep) if(deq_guard);
+    method Action deqWrite(Maybe#(pipeCmdT) newCmd, ramDataT wrRam, Bool updateRep, Bool invisible) if(deq_guard);
         match2OutT m2o = fromMaybe(?, mat2Out_out);
         wayT way = m2o.way;
         indexT index = getIndex(m2o.cmd);
@@ -372,9 +408,20 @@ module mkCCPipe#(
             repInfo <- updateRepInfo(m2o.repInfo, way);
         end
         // write ram
-        infoRam[way].wrReq(index, wrRam.info);
-        repRam.wrReq(index, repInfo);
-        dataRam.wrReq(getDataRamIndex(way, index), wrRam.line);
+        if(invisible &&& current_cache_state_out matches tagged Valid .old) begin
+            if (verbose) $display("%t CCPipe %m deqWrite: use old data for index : ", $time, fshow(index));
+            let owner = wrRam.info.owner;
+            wrRam.info = old.info;
+            repInfo = old.repInfo;
+            wrRam.line = fromMaybe(dataRam.rdResp, old.line);
+            wrRam.info.owner = owner; // only keep the mshr that edits this entry
+        end
+        else begin
+            doAssert(!invisible, "cannot be an invisible with invalid old cache state");
+        end
+            infoRam[way].wrReq(index, wrRam.info);
+            repRam.wrReq(index, repInfo);
+            dataRam.wrReq(getDataRamIndex(way, index), wrRam.line);
         // set bypass to Enq and Match stages
         bypass.wset(BypassInfo {
             index: index,
@@ -393,11 +440,17 @@ module mkCCPipe#(
                 repInfo: repInfo, // get bypass
                 line: Valid (wrRam.line) // get bypass
             });
+            current_cache_state_out <= Valid(OldCacheState {
+                info: wrRam.info,
+                repInfo: repInfo,
+                line: Valid(wrRam.line)
+            });
         end
         else begin
             // XXX deq ram resp, I think this should not block
             dataRam.deqRdResp;
             // reset pipeline reg
+            current_cache_state_out <= Invalid;
             mat2Out_out <= Invalid;
         end
     endmethod

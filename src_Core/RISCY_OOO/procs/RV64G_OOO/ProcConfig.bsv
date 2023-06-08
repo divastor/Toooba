@@ -183,7 +183,7 @@
     `define NUM_SPEC_TAGS 12
 
     // LSQ
-    `define LDQ_SIZE 24
+    `define LDQ_SIZE 48
     `define STQ_SIZE 14
     `define SB_SIZE 4
 

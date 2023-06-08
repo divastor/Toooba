@@ -357,7 +357,8 @@ endfunction
         pRqIdxT n <- pRqMshr.getEmptyEntryInit(PRqMsg {
             addr: ?,
             toState: I,
-            child: ?
+            child: ?,
+            isInvisible: False
         });
         pipeline.send(Flush (L1PipeFlushIn {
             index: flushIndex,
@@ -396,14 +397,15 @@ endfunction
             addr: {slot.repTag, truncate(req.addr)}, // get bank id & index from req
             toState: I,
             data: data,
-            child: ?
+            child: ?,
+            isInvisible: req.isInvisible
         };
         rsToPQ.enq(resp);
         // req parent for upgrade & change state
         rqToPIndexQ_sendRsToP.enq(n);
         cRqMshr.sendRsToP_cRq.setWaitSt_setSlot_clearData(n, L1CRqSlot {
             way: slot.way,
-            cs: I, // replacement, so I (get ready for rqToIndex.deq)
+            cs: req.isInvisible ? slot.cs : I, // replacement, so I (get ready for rqToIndex.deq)
             repTag: ?,
             waitP: True // we have req parent at the same time
         });
@@ -426,7 +428,8 @@ endfunction
             addr: req.addr,
             toState: req.toState,
             data: data,
-            child: ?
+            child: ?,
+            isInvisible: req.isInvisible
         };
         rsToPQ.enq(resp);
         pRqMshr.sendRsToP_pRq.releaseEntry(n); // mshr entry released
@@ -451,7 +454,8 @@ endfunction
             toState: req.toState,
             canUpToE: True,
             id: slot.way,
-            child: ?
+            child: ?,
+            isInvisible: req.isInvisible
         };
         rqToPQ.enq(cRqToP);
        if (verbose)
@@ -488,7 +492,7 @@ endfunction
     Maybe#(cRqIdxT) pipeOutSucc = cRqMshr.pipelineResp.getSucc(pipeOutCRqIdx);
 
     // function to process cRq hit (MSHR slot may have garbage)
-    function Action cRqHit(cRqIdxT n, procRqT req);
+    function Action cRqHit(cRqIdxT n, procRqT req, Bool invisibleReq);
     action
        if (verbose)
         $display("%t L1 %m pipelineResp: Hit func: ", $time,
@@ -497,9 +501,8 @@ endfunction
         );
         // check tag & cs: even this function is called by pRs, tag should match,
         // because tag is written into cache before sending req to parent
-        doAssert(ram.info.tag == getTag(req.addr) && enoughCacheState(ram.info.cs, req.toState),
-            "cRqHit but tag or cs incorrect"
-        );
+        doAssert(enoughCacheState(ram.info.cs, req.toState), "cRqHit but cs incorrect");
+        doAssert(ram.info.tag == getTag(req.addr) || invisibleReq, "cRqHit but tag incorrect");
         // process req: resp processor and get new cache line
         // TODO when we have MESI, cache state may also need update
         Line curLine = ram.line;
@@ -557,7 +560,7 @@ endfunction
                     other: ?
                 },
                 line: newLine // write new data into cache
-            }, True); // hit, so update rep info
+            }, True, invisibleReq); // hit, so update rep info
 	   if (verbose)
             $display("%t L1 %m pipelineResp: Hit func: update ram: ", $time,
                 fshow(newLine), " ; ",
@@ -606,7 +609,7 @@ endfunction
                 other: ?
             },
             line: newLine // write new data into cache
-        }, True); // hit, so update rep info
+        }, True, False); // hit, so update rep info
         doAssert(req.toState == M, "AMO must req for M");
        if (verbose)
         $display("%t L1 %m processAmo: update ram: ", $time,
@@ -627,6 +630,8 @@ endfunction
        if (verbose)
         $display("%t L1 %m pipelineResp: cRq: ", $time, fshow(n), " ; ", fshow(procRq));
         
+        Bool isInvisible = procRq.isInvisible;
+
         // find end of dependency chain
         Maybe#(cRqIdxT) cRqEOC = cRqMshr.pipelineResp.searchEndOfChain(procRq.addr);
 
@@ -648,7 +653,7 @@ endfunction
                     other: ram.info.other
                 },
                 line: ram.line
-            }, False);
+            }, False, False);
             // retry successor
             Maybe#(cRqIdxT) succ = pipeOutSucc;
             if(succ matches tagged Valid .s) begin
@@ -688,14 +693,14 @@ endfunction
             // deq pipeline & set owner, tag
             pipeline.deqWrite(Invalid, RamData {
                 info: CacheInfo {
-                    tag: getTag(procRq.addr), // tag may be garbage if cs == I
+                    tag: isInvisible ? ram.info.tag : getTag(procRq.addr), // tag may be garbage if cs == I
                     cs: ram.info.cs,
                     dir: ?,
                     owner: Valid (n), // owner is req itself
                     other: ?
                 },
                 line: ram.line
-            }, False);
+            }, False, isInvisible);//isInvisible);
         endaction
         endfunction
 
@@ -705,18 +710,18 @@ endfunction
             // deq pipeline
             pipeline.deqWrite(Invalid, RamData {
                 info: CacheInfo {
-                    tag: getTag(procRq.addr), // set to req tag (old tag is replaced right now)
-                    cs: I,
+                    tag: isInvisible ? ram.info.tag : getTag(procRq.addr), // set to req tag (old tag is replaced right now)
+                    cs: isInvisible ? ram.info.cs : I,
                     dir: ?,
                     owner: Valid (n), // owner is req itself
                     other: ?
                 },
                 line: ? // data is no longer used
-            }, False);
+            }, False, isInvisible);
             // update MSHR: may save replaced line data
             cRqMshr.pipelineResp.setStateSlot(n, WaitNewTag, L1CRqSlot {
                 way: pipeOut.way, // use way from pipeline
-                cs: I,
+                cs: isInvisible ? ram.info.cs : I,
                 repTag: ram.info.tag, // tag being replaced
                 waitP: False // we send req to parent later (when resp to parent is sent)
             });
@@ -735,7 +740,7 @@ endfunction
         function Action cRqSetDepNoCacheChange;
         action
             cRqMshr.pipelineResp.setStateSlot(n, Depend, defaultValue);
-            pipeline.deqWrite(Invalid, pipeOut.ram, False);
+            pipeline.deqWrite(Invalid, pipeOut.ram, False, isInvisible);//isInvisible);
         endaction
         endfunction
 
@@ -749,6 +754,11 @@ endfunction
         Bool enough_cs = enoughCacheState(ram.info.cs, procRq.toState);
         // check if cs is not I
         Bool cs_valid = ram.info.cs > I;
+        if (verbose)
+            $display("%t L1 %m scFail: ", $time,
+                fshow(scFail), ", tag_match: ", fshow(tag_match),
+                ", enough_cs: ", fshow(enough_cs), ", cs_valid: ", fshow(cs_valid)
+            );
 
         if(ram.info.owner matches tagged Valid .cOwner) begin
             if(cOwner != n) begin
@@ -757,7 +767,8 @@ endfunction
                 doAssert(pipeOutCState == Init, "must first time go through tag match");
                 doAssert(cs_valid && tag_match, "cRq should hit in tag match");
                 // should be added to a cRq in dependency chain & deq from pipeline
-                doAssert(isValid(cRqEOC), ("cRq hit on another cRq, cRqEOC must be true"));
+                // invisible req have mshr's with I state
+                // doAssert(isValid(cRqEOC), ("cRq hit on another cRq, cRqEOC must be true"));
                 cRqMshr.pipelineResp.setSucc(fromMaybe(?, cRqEOC), Valid (n));
                 cRqSetDepNoCacheChange;
 	       if (verbose)
@@ -769,14 +780,14 @@ endfunction
                 // owner is myself, so must be swapped in
                 // tag should match, since always swapped in by cRq, cs > I
                 doAssert(pipeOutCState == Depend, "must be swapped in");
-                doAssert(cs_valid && tag_match,
-                    "cRq swapped in by previous cRq, tag must match & cs > I"
-                );
+                // doAssert((cs_valid && tag_match) || isInvisible,
+                //     "cRq swapped in by previous cRq, tag must match & cs > I"
+                // );
                 // Hit or Miss (but no replacement)
-                if(enough_cs) begin
+                if(tag_match && enough_cs) begin
 		   if (verbose)
                     $display("%t L1 %m pipelineResp: cRq: own by itself, hit", $time);
-                    cRqHit(n, procRq);
+                    cRqHit(n, procRq, isInvisible);//isInvisible); // TODO: revisit whether to modify (speculative)
                 end
                 else if(scFail) begin
                     // Sc already fails, so we don't need to req parent.  Since
@@ -787,6 +798,12 @@ endfunction
                         $time, fshow(linkAddr)
                     );
                     cRqScEarlyFail(True);
+                end
+                else if(cs_valid && !tag_match) begin
+                    // Req parent, need replacement
+		   if (verbose)
+                    $display("%t L1 %m pipelineResp: cRq: no owner, replace", $time);
+                    cRqReplacement;
                 end
                 else begin
 		   if (verbose)
@@ -819,7 +836,7 @@ endfunction
                     doAssert(cs_valid, "hit, so cs must > I");
 		   if (verbose)
                     $display("%t L1 %m pipelineResp: cRq: no owner, hit", $time);
-                    cRqHit(n, procRq);
+                    cRqHit(n, procRq, isInvisible);//isInvisible);
                 end
                 else if(scFail) begin
                     // Sc already fails, so we don't need to req parent.  Since
@@ -855,10 +872,10 @@ endfunction
 
         if(ram.info.owner matches tagged Valid .cOwner) begin
             procRqT procRq = pipeOutCRq;
-            doAssert(ram.info.cs >= procRq.toState && ram.info.tag == getTag(procRq.addr),
+            doAssert((ram.info.cs >= procRq.toState && ram.info.tag == getTag(procRq.addr)) || procRq.isInvisible,
                 ("pRs must be a hit")
             );
-            cRqHit(cOwner, procRq);
+            cRqHit(cOwner, procRq, procRq.isInvisible);
             // performance counter: miss cRq
             incrMissCnt(procRq.op, cOwner);
         end
@@ -882,7 +899,7 @@ endfunction
             // pRq can be directly dropped
             // must go through tag match, no successor
             pRqMshr.pipelineResp.releaseEntry(n);
-            pipeline.deqWrite(Invalid, pipeOut.ram, False);
+            pipeline.deqWrite(Invalid, pipeOut.ram, False, pRq.isInvisible);
             // sanity check (ram.info.tag != getTag(pRq.addr) is useless)
             if(!pipeOut.pRqMiss) begin
                 doAssert(ram.info.cs == S && pRq.toState == S && ram.info.tag == getTag(pRq.addr),
@@ -916,7 +933,7 @@ endfunction
                     other: ?
                 },
                 line: ram.line
-            }, False);
+            }, False, pRq.isInvisible);
             rsToPIndexQ.enq(PRq (n));
             // update cRq bookkeeping
             cRqMshr.pipelineResp.setStateSlot(cOwner, WaitSt, L1CRqSlot {
@@ -947,7 +964,7 @@ endfunction
                     other: ?
                 },
                 line: ram.line
-            }, False);
+            }, False, pRq.isInvisible);
             rsToPIndexQ.enq(PRq (n));
         end
 
@@ -1000,7 +1017,7 @@ endfunction
                 other: ?
             },
             line: ?
-        }, False);
+        }, False, False);
 
         // always reset link addr
         linkAddr <= Invalid;

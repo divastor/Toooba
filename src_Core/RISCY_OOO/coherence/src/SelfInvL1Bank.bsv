@@ -341,7 +341,8 @@ module mkSelfInvL1Bank#(
             addr: {slot.repTag, truncate(req.addr)}, // get bank id & index from req
             toState: I,
             data: data,
-            child: ?
+            child: ?,
+            isInvisible: req.isInvisible
         };
         rsToPQ.enq(resp);
         // req parent for upgrade & change state
@@ -371,7 +372,8 @@ module mkSelfInvL1Bank#(
             addr: req.addr,
             toState: req.toState,
             data: data,
-            child: ?
+            child: ?,
+            isInvisible: req.isInvisible
         };
         rsToPQ.enq(resp);
         pRqMshr.sendRsToP_pRq.releaseEntry(n); // mshr entry released
@@ -397,7 +399,8 @@ module mkSelfInvL1Bank#(
             toState: req.toState,
             canUpToE: True,
             id: slot.way,
-            child: ?
+            child: ?,
+            isInvisible: False
         };
         rqToPQ.enq(cRqToP);
        if (verbose)

@@ -365,6 +365,6 @@ module mkSelfInvLLPipe(
             newCmd = Valid (CRq (SelfInvLLPipeCRqIn {addr: addr, mshrIdx: idx}));
         end
         // call pipe
-        pipe.deqWrite(newCmd, wrRam, updateRep);
+        pipe.deqWrite(newCmd, wrRam, updateRep, False);
     endmethod
 endmodule

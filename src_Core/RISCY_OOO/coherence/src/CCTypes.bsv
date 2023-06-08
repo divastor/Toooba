@@ -30,6 +30,8 @@ import Assert::*;
 import Connectable::*;
 import GetPut::*;
 import ClientServer::*;
+// InvisiSpec: ...
+import ProcTypes::*;
 
 `ifdef PERFORMANCE_MONITORING
 typedef struct {
@@ -214,6 +216,8 @@ typedef struct {
     ByteEn byteEn; // valid when op == Sc
     Data data; // valid when op == Sc/Amo
     AmoInst amoInst; // valid when op == Amo
+    // InvisiSpec:
+    Bool isInvisible;
 } ProcRq#(type idT) deriving(Bits, Eq, FShow);
 
 interface L1ProcReq#(type idT);
@@ -262,6 +266,7 @@ typedef struct {
     Bool canUpToE; // meaningful to upgrade to E if toState is S
     idT id; // slot id in child cache
     childT child; // from which child
+    Bool isInvisible;
 } CRqMsg#(type idT, type childT) deriving(Bits, Eq, FShow);
 
 typedef struct {
@@ -269,12 +274,14 @@ typedef struct {
     Msi toState;
     Maybe#(Line) data;
     childT child; // from which child
+    Bool isInvisible;
 } CRsMsg#(type childT) deriving(Bits, Eq, FShow);
 
 typedef struct {
     Addr addr;
     Msi toState;
     childT child; // to which child
+    Bool isInvisible;
 } PRqMsg#(type childT) deriving(Bits, Eq, FShow);
 
 typedef struct {
@@ -283,6 +290,7 @@ typedef struct {
     childT child; // to which child
     Maybe#(Line) data;
     idT id; // slot id in cache
+    Bool isInvisible;
 } PRsMsg#(type idT, type childT) deriving(Bits, Eq, FShow);
 
 typedef union tagged {
@@ -320,6 +328,8 @@ typedef struct {
     LineByteEn byteEn;
     // req id: distinguish between child and dma
     LLRqId#(cRqIdT, dmaRqIdT) id;
+    // InvisiSpec:
+    Bool isInvisible;
 } LLRq#(type cRqIdT, type dmaRqIdT, type childT) deriving(Bits, Eq, FShow);
 
 // memory msg

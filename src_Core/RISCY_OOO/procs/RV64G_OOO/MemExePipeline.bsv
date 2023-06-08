@@ -273,7 +273,7 @@ module mkMemExePipeline#(MemExeInput inIfc)(MemExePipeline);
     Fifo#(1, WaitStResp) waitStRespQ <- mkCFFifo;
 `endif
     // fifo for req mem
-    Fifo#(1, Tuple2#(LdQTag, Addr)) reqLdQ <- mkBypassFifo;
+    Fifo#(1, Tuple3#(LdQTag, Addr, Bool)) reqLdQ <- mkBypassFifo;
     Fifo#(1, ProcRq#(DProcReqId)) reqLrScAmoQ <- mkBypassFifo;
 `ifdef TSO_MM
     Fifo#(1, Addr) reqStQ <- mkBypassFifo;
@@ -634,8 +634,8 @@ module mkMemExePipeline#(MemExeInput inIfc)(MemExePipeline);
             end
 `endif
         end
-        else if(issRes == ToCache) begin
-            reqLdQ.enq(tuple2(zeroExtend(info.tag), info.paddr));
+        else if(issRes matches tagged ToCache .reqType) begin
+            reqLdQ.enq(tuple3(zeroExtend(info.tag), info.paddr, reqType == Invisible));
             // perf: load mem latency
             ldMemLatTimer.start(info.tag);
         end
@@ -787,7 +787,8 @@ module mkMemExePipeline#(MemExeInput inIfc)(MemExePipeline);
             op: Lr,
             byteEn: ?,
             data: ?,
-            amoInst: ?
+            amoInst: ?,
+            isInvisible: False
         };
         reqLrScAmoQ.enq(req);
         if(verbose) $display("[doDeqLdQ_Lr_issue] ", fshow(lsqDeqLd), "; ", fshow(req));
@@ -1087,7 +1088,8 @@ module mkMemExePipeline#(MemExeInput inIfc)(MemExePipeline);
                 doubleWord: lsqDeqSt.shiftedBE == replicate(True),
                 aq: lsqDeqSt.acq,
                 rl: lsqDeqSt.rel
-            }
+            },
+            isInvisible: False
         };
         reqLrScAmoQ.enq(req);
         if(verbose) $display("[doDeqStQ_ScAmo_issue] ", fshow(lsqDeqSt), "; ", fshow(req));
@@ -1274,7 +1276,7 @@ module mkMemExePipeline#(MemExeInput inIfc)(MemExePipeline);
 
     // send req to D$
     rule sendLdToMem;
-        let {lsqTag, addr} <- toGet(reqLdQ).get;
+        let {lsqTag, addr, isInvisible} <- toGet(reqLdQ).get;
         dMem.procReq.req(ProcRq {
             id: zeroExtend(lsqTag),
             addr: addr,
@@ -1282,7 +1284,8 @@ module mkMemExePipeline#(MemExeInput inIfc)(MemExePipeline);
             op: Ld,
             byteEn: ?,
             data: ?,
-            amoInst: ?
+            amoInst: ?,
+            isInvisible: isInvisible
         });
     endrule
     (* descending_urgency = "sendLdToMem, sendStToMem" *) // prioritize Ld over St
@@ -1301,7 +1304,8 @@ module mkMemExePipeline#(MemExeInput inIfc)(MemExePipeline);
             op: St,
             byteEn: ?,
             data: ?,
-            amoInst: ?
+            amoInst: ?,
+            isInvisible: False
         });
     endrule
     (* descending_urgency = "sendLrScAmoToMem, sendStToMem" *) // prioritize Lr/Sc/Amo over St

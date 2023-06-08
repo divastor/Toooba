@@ -244,7 +244,8 @@ module mkSelfInvIBank#(
             toState: S, // I$ upgrade to S
             canUpToE: False,
             id: slot.way,
-            child: ?
+            child: ?,
+            isInvisible: False
         };
         rqToPQ.enq(cRqToP);
        if (verbose)

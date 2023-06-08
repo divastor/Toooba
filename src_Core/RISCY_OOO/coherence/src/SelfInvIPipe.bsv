@@ -455,7 +455,7 @@ module mkSelfInvIPipe(
             newCmd = Valid (CRq (SelfInvIPipeRqIn {addr: addr, mshrIdx: idx}));
         end
         // call pipe
-        pipe.deqWrite(newCmd, wrRam, updateRep);
+        pipe.deqWrite(newCmd, wrRam, updateRep, False);
         // conflict with reconcile
         conflict_reconcile_deq.wset(?);
     endmethod

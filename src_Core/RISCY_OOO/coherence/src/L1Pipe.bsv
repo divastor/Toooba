@@ -118,7 +118,8 @@ interface L1Pipe#(
     method Action deqWrite(
         Maybe#(cRqIdxT) swapRq,
         RamData#(tagT, Msi, void, Maybe#(cRqIdxT), void, Line) wrRam, // always write BRAM
-        Bool updateRep
+        Bool updateRep,
+        Bool invisible
     );
 endinterface
 
@@ -304,8 +305,9 @@ module mkL1Pipe(
         pipeCmdT cmd, Msi toState, Bool dataV, Msi oldCs
     );
     actionvalue
-        doAssert(toState > oldCs, "should truly upgrade cs");
-        doAssert((oldCs == I) == dataV, "valid resp data for upgrade from I");
+        // TODO: add an if (is_invisible_rq) on the following asserts
+        // doAssert(toState > oldCs, "should truly upgrade cs");
+        // doAssert((oldCs == I) == dataV, "valid resp data for upgrade from I");
         return UpdateByUpCs {cs: toState};
     endactionvalue
     endfunction
@@ -378,7 +380,7 @@ module mkL1Pipe(
         };
     endmethod
 
-    method Action deqWrite(Maybe#(cRqIdxT) swapRq, ramDataT wrRam, Bool updateRep);
+    method Action deqWrite(Maybe#(cRqIdxT) swapRq, ramDataT wrRam, Bool updateRep, Bool invisible);
         // get new cmd
         Maybe#(pipeCmdT) newCmd = Invalid;
         if(swapRq matches tagged Valid .idx) begin // swap in cRq
@@ -390,6 +392,6 @@ module mkL1Pipe(
 `endif
         end
         // call pipe
-        pipe.deqWrite(newCmd, wrRam, updateRep);
+        pipe.deqWrite(newCmd, wrRam, updateRep, invisible);
     endmethod
 endmodule

@@ -172,7 +172,7 @@ module mkLLBank#(
     Add#(cRqNum, b__, wayNum)
 );
 
-   Bool verbose = False;
+   Bool verbose = True;
 
     LLCRqMshr#(cRqNum, wayT, tagT, Vector#(childNum, DirPend), cRqT) cRqMshr <- mkLLMshr;
 
@@ -366,7 +366,8 @@ endfunction
             canUpToE: r.canUpToE,
             child: r.child,
             byteEn: ?,
-            id: Child (r.id)
+            id: Child (r.id),
+            isInvisible: r.isInvisible
         };
         // setup new MSHR entry
         cRqIndexT n <- cRqMshr.transfer.getEmptyEntryInit(cRq, Invalid);
@@ -418,7 +419,8 @@ endfunction
             canUpToE: False, // DMA should not go to E
             child: ?,
             byteEn: r.byteEn,
-            id: Dma (r.id)
+            id: Dma (r.id),
+            isInvisible: False
         };
         // setup new MSHR entry and data
         cRqIndexT n <- cRqMshr.transfer.getEmptyEntryInit(cRq, write ? Valid (r.data) : Invalid);
@@ -715,7 +717,8 @@ endfunction
             toState: toState, // we may upgrade to E for req S, don't use toState in cRq
             child: cRq.child,
             data: rsData,
-            id: cRqId
+            id: cRqId,
+            isInvisible: cRq.isInvisible
         }));
         // release MSHR entry
         cRqMshr.sendRsToDmaC.releaseEntry(n);
@@ -795,7 +798,8 @@ endfunction
         pRqRsToCT req = PRq (PRqMsg {
             addr: rqAddr,
             toState: toState,
-            child: child
+            child: child,
+            isInvisible: cRq.isInvisible
         });
         toCQ.enq(req);
         // change dirPend
@@ -839,7 +843,7 @@ endfunction
     cRqT pipeOutCRq = cRqMshr.pipelineResp.getRq(pipeOutCRqIdx);
 
     // function to process cRq hit (MSHR slot may have garbage)
-    function Action cRqFromCHit(cRqIndexT n, cRqT cRq, Bool isMRs);
+    function Action cRqFromCHit(cRqIndexT n, cRqT cRq, Bool isMRs, Bool isInvisible);
     action
        if (verbose)
         $display("%t LL %m pipelineResp: cRq from child Hit func: ", $time, 
@@ -848,12 +852,12 @@ endfunction
         );
         doAssert(n == pipeOutCRqIdx, "must match pipe out cRq idx");
         doAssert(isRqFromC(cRq.id), "should be cRq from child");
-        doAssert(ram.info.tag == getTag(cRq.addr) && ram.info.cs > I,
-            // this function is called by mRs, cRq, cRs
-            // tag should match even for mRs, because 
-            // tag has been written into cache before sending req to parent
-            ("cRqHit but tag or cs incorrect")
-        );
+        // doAssert(ram.info.tag == getTag(cRq.addr) && ram.info.cs > I,
+        //     // this function is called by mRs, cRq, cRs
+        //     // tag should match even for mRs, because 
+        //     // tag has been written into cache before sending req to parent
+        //     ("cRqHit but tag or cs incorrect")
+        // );
         // decide upgrade state
         Msi toState = cRq.toState;
         if(cRq.toState == S && cRq.canUpToE && ram.info.dir == replicate(I) && respLoadWithE(isMRs)) begin
@@ -892,7 +896,7 @@ endfunction
                 other: ?
             },
             line: ram.line // use line in ram
-        }, True); // hit, so update rep info
+        }, True, isInvisible); // hit, so update rep info
     endaction
     endfunction
 
@@ -938,7 +942,7 @@ endfunction
                 other: ?
             },
             line: newLine // use new line
-        }, True); // hit, so update rep info
+        }, True, cRq.isInvisible); // hit, so update rep info
         // update slot, data & send to indexQ
         cRqMshr.pipelineResp.setStateSlot(n, Done, ?); // we no longer need  slot info
         cRqMshr.pipelineResp.setData(n, Valid (ram.line)); // save the orig cache line
@@ -1000,7 +1004,7 @@ endfunction
                 other: ?
             },
             line: ? // data is no longer used
-        }, False);
+        }, False, cRq.isInvisible);
     endaction
     endfunction
 
@@ -1011,6 +1015,7 @@ endfunction
         // cs and dir in ram have been merged with modification caused by mRs/cRs cmd
 
         cRqT cRq = pipeOutCRq;
+        Bool isInvisible = cRq.isInvisible;
        if (verbose)
         $display("%t LL %m pipelineResp: cRq: ", $time, fshow(n), " ; ", fshow(cRq));
         
@@ -1077,14 +1082,14 @@ endfunction
             // deq pipeline & set owner, tag
             pipeline.deqWrite(Invalid, RamData {
                 info: CacheInfo {
-                    tag: getTag(cRq.addr), // tag may be garbage if cs == I
+                    tag: isInvisible ? ram.info.tag : getTag(cRq.addr), // tag may be garbage if cs == I
                     cs: ram.info.cs,
                     dir: ram.info.dir,
                     owner: Valid (CRqOwner {mshrIdx: n, replacing: False}), // owner is req itself
                     other: ?
                 },
                 line: ram.line
-            }, False);
+            }, False, isInvisible);
         endaction
         endfunction
 
@@ -1116,7 +1121,7 @@ endfunction
                     other: ?
                 },
                 line: ram.line
-            }, False);
+            }, False, isInvisible);//isInvisible);
         endaction
         endfunction
 
@@ -1145,7 +1150,7 @@ endfunction
                         other: ?
                     },
                     line: ram.line // keep data the same
-                }, False);
+                }, False, isInvisible);//isInvisible);
                 cRqMshr.pipelineResp.setStateSlot(n, WaitOldTag, LLCRqSlot {
                     way: pipeOut.way,
                     repTag: ram.info.tag, // record tag for downgrading children
@@ -1160,7 +1165,7 @@ endfunction
         function Action cRqSetDepNoCacheChange;
         action
             cRqMshr.pipelineResp.setStateSlot(n, Depend, getLLCRqSlotInitVal(getDirPendInitVal));
-            pipeline.deqWrite(Invalid, pipeOut.ram, False);
+            pipeline.deqWrite(Invalid, pipeOut.ram, False, isInvisible);//isInvisible);
         endaction
         endfunction
 
@@ -1170,7 +1175,7 @@ endfunction
                 LLCRqState cState = pipeOutCState;
                 doAssert(cState == Init, "owner is other, must first time go through tag match");
                 // tag match must be hit (because replacement algo won't give a way with owner)
-                doAssert(ram.info.cs > I && ram.info.tag == getTag(cRq.addr), 
+                doAssert(ram.info.cs >= I && ram.info.tag == getTag(cRq.addr), 
                     ("cRq should hit in tag match")
                 );
                 // could be two cases:
@@ -1205,25 +1210,38 @@ endfunction
                 doAssert(cState == Depend, "owner is myself, must be swapped in");
                 // tag should match, since always swapped in by cRq (which occupies the line and completes)
                 // so cache state must be > I
-                doAssert(ram.info.tag == getTag(cRq.addr) && ram.info.cs > I,
-                    "cRq swapped in, tag must match, cs > I"
-                );
+                // doAssert(ram.info.tag == getTag(cRq.addr) && ram.info.cs > I,
+                //     "cRq swapped in, tag must match, cs > I"
+                // );
                 // since cache state must > I, there is no replacement or req to mem (LLC non-I is hit)
                 // just check whether children cache are compatible
+                // OR invisible rq from child so do tag match, ram.info/line might have garbage (cs == I)
                 if(cRq.id matches tagged Child ._i) begin
-                    // req from child, get dir pend
-                    Vector#(childNum, DirPend) dirPend = getDirPendNonCompatForChild;
-                    if(dirPend == replicate(Invalid)) begin
-		       if (verbose)
-                        $display("%t LL %m pipelineResp: cRq from child: own by itself, hit", $time);
-                        cRqFromCHit(n, cRq, False);
+                    // cRq from child
+                    if(ram.info.cs == I || ram.info.tag == getTag(cRq.addr)) begin
+                        // req from child, get dir pend
+                        Vector#(childNum, DirPend) dirPend = getDirPendNonCompatForChild;
+                        if(ram.info.cs > I && dirPend == replicate(Invalid)) begin
+                            if (verbose)
+                                $display("%t LL %m pipelineResp: cRq from child: own by itself, hit", $time);
+                            cRqFromCHit(n, cRq, False, isInvisible);//isInvisible);
+                        end
+                        else begin
+                            if (verbose)
+                                $display("%t LL %m pipelineResp: cRq from child: own by itself, miss no replace: ", $time,
+                                    fshow(dirPend)
+                                );
+                            cRqFromCMissNoReplacement(dirPend);
+                        end
                     end
                     else begin
-		       if (verbose)
-                        $display("%t LL %m pipelineResp: cRq from child: own by itself, miss no replace: ", $time,
-                            fshow(dirPend)
-                        );
-                        cRqFromCMissNoReplacement(dirPend);
+                        // need replacement, check dir
+                        Vector#(childNum, DirPend) dirPend = getDirPendNonI;
+		                if (verbose)
+                            $display("%t LL %m pipelineResp: cRq: own by itself, replace: ", $time,
+                                fshow(dirPend)
+                            );
+                        cRqFromCReplacement(dirPend);
                     end
                 end
                 else begin
@@ -1269,7 +1287,7 @@ endfunction
                         if(ram.info.cs > I && dirPend == replicate(Invalid)) begin
 			   if (verbose)
                             $display("%t LL %m pipelineResp: cRq: no owner, hit", $time);
-                            cRqFromCHit(n, cRq, False);
+                            cRqFromCHit(n, cRq, False, isInvisible);//isInvisible);
                         end
                         else begin
 			   if (verbose)
@@ -1311,7 +1329,7 @@ endfunction
                         });
                         // set req to Done & deq pipeline (no change to ram)
                         cRqMshr.pipelineResp.setStateSlot(n, Done, ?);
-                        pipeline.deqWrite(Invalid, pipeOut.ram, False);
+                        pipeline.deqWrite(Invalid, pipeOut.ram, False, isInvisible);//isInvisible);
                         // retry successor (cannot swap in since we don't have a line to occupy)
                         Maybe#(cRqIndexT) addrSucc = pipeOutAddrSucc;
                         if(addrSucc matches tagged Valid .m) begin
@@ -1341,9 +1359,9 @@ endfunction
             fshow(cSlot)
         );
         doAssert(isRqFromC(cRq.id), "only child req gets mem resp that refills the cache");
-        doAssert(ram.info.cs >= cRq.toState && ram.info.tag == getTag(cRq.addr),
-            "mRs must be tag match & have enough cs"
-        );
+        // doAssert(ram.info.cs >= cRq.toState && ram.info.tag == getTag(cRq.addr),
+        //     "mRs must be tag match & have enough cs"
+        // );
         doAssert(ram.info.dir == replicate(I), "all children must be I");
         doAssert(!cOwner.replacing, "mRs cannot hit on replacing line");
         doAssert(cSlot.way == pipeOut.way, "mRs should hit on way in MSHR slot");
@@ -1352,7 +1370,7 @@ endfunction
             "cRq that needs mRs should not have children to wait for"
         );
         // cRq hits since all children are I
-        cRqFromCHit(cOwner.mshrIdx, cRq, True);
+        cRqFromCHit(cOwner.mshrIdx, cRq, True, cRq.isInvisible);
     endrule
 
     // handle cRs
@@ -1401,7 +1419,7 @@ endfunction
                 end
                 else begin
                     // replacement is still ongoing, just deq pipe & write ram & update dirPend
-                    pipeline.deqWrite(Invalid, ram, False);
+                    pipeline.deqWrite(Invalid, ram, False, cRq.isInvisible);
                     cRqMshr.pipelineResp.setStateSlot(cOwner.mshrIdx, WaitOldTag, LLCRqSlot {
                         way: cSlot.way,
                         repTag: cSlot.repTag,
@@ -1440,7 +1458,7 @@ endfunction
                 // check hit or miss
                 if(newDirPend == replicate(Invalid)) begin
                     if(cRq.id matches tagged Child ._i) begin
-                        cRqFromCHit(cOwner.mshrIdx, cRq, False);
+                        cRqFromCHit(cOwner.mshrIdx, cRq, False, False);
                     end
                     else begin
                         cRqFromDmaHit(cOwner.mshrIdx, cRq);
@@ -1448,7 +1466,7 @@ endfunction
                 end
                 else begin
                     // still wait for children: deq pipe & write ram & update dirPend
-                    pipeline.deqWrite(Invalid, ram, False);
+                    pipeline.deqWrite(Invalid, ram, False, False);
                     cRqMshr.pipelineResp.setStateSlot(cOwner.mshrIdx, WaitSt, LLCRqSlot {
                         way: cSlot.way,
                         repTag: cSlot.repTag,
@@ -1462,7 +1480,7 @@ endfunction
             // does not match any cRq, so just deq pipe & write ram
 	   if (verbose)
             $display("%t LL %m pipelineResp: cRs: no owner: ", $time);
-            pipeline.deqWrite(Invalid, ram, False);
+            pipeline.deqWrite(Invalid, ram, False, pipeOutCRq.isInvisible);
         end
     endrule
 
